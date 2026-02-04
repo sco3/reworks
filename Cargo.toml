@@ -4,7 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
+http-body-util = "0.1"
+rustls = "0.23"
+rustls-pemfile = "2.0"
+tokio-rustls = "0.26"
+webpki-roots = "0.26"
 clap = { version = "4.4", features = ["derive"] }
 anyhow = "1.0"
 
