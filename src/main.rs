@@ -1,12 +1,11 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use reqwest::blocking::Client;
-use reqwest::{Certificate, Method};
+use reqwest::{Certificate, Client, Method};
 use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::thread;
 use std::time::{Duration, Instant};
+use tokio::task::JoinSet;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "HTTP benchmarking tool", long_about = None)]
@@ -154,7 +153,14 @@ fn create_client(args: &Args) -> Result<Client> {
         .danger_accept_invalid_certs(args.insecure)
         .pool_max_idle_per_host(10000)
         .pool_idle_timeout(Duration::from_secs(90))
-        .timeout(Duration::from_secs(30));
+        .timeout(Duration::from_secs(30))
+        .use_rustls_tls()
+        // HTTP/2 optimizations
+        .http2_initial_connection_window_size(2 * 1024 * 1024) // 2MB
+        .http2_initial_stream_window_size(1024 * 1024)         // 1MB
+        .http2_adaptive_window(true)
+        .http2_keep_alive_interval(Some(Duration::from_secs(30)))
+        .http2_keep_alive_timeout(Duration::from_secs(10));
 
     // Note: Client certificate (mutual TLS) is not supported with rustls-tls backend
     if args.cert.is_some() || args.key.is_some() {
@@ -174,7 +180,7 @@ fn create_client(args: &Args) -> Result<Client> {
     builder.build().context("Failed to build HTTP client")
 }
 
-fn make_request(
+async fn make_request(
     client: &Client,
     method: &Method,
     url: &str,
@@ -191,25 +197,24 @@ fn make_request(
         request = request.body(body_content.clone());
     }
 
-    match request.send() {
+    match request.send().await {
         Ok(response) => {
             let status = response.status();
             // Consume the body
-            let _ = response.bytes();
+            let _ = response.bytes().await;
             status.is_success() || status.is_redirection()
         }
         Err(_) => false,
     }
 }
 
-fn run_benchmark(
+async fn run_benchmark(
     args: Arc<Args>,
     client: Client,
     result: Arc<BenchmarkResult>,
     duration: Duration,
 ) -> Result<()> {
-    let method =
-        Method::from_bytes(args.method.as_bytes()).context("Invalid HTTP method")?;
+    let method = Method::from_bytes(args.method.as_bytes()).context("Invalid HTTP method")?;
 
     // Parse headers
     let headers: Arc<Vec<(String, String)>> = Arc::new(
@@ -227,36 +232,30 @@ fn run_benchmark(
     );
 
     let end_time = Instant::now() + duration;
-    let connections_per_thread = args.connections / args.threads.max(1);
-    let connections_per_thread = connections_per_thread.max(1);
+    let total_connections = args.connections;
 
-    let mut handles = vec![];
+    let mut tasks = JoinSet::new();
 
-    for _ in 0..args.threads {
-        for _ in 0..connections_per_thread {
-            let client = client.clone();
-            let method = method.clone();
-            let url = args.url.clone();
-            let headers = headers.clone();
-            let body = args.body.clone();
-            let result = result.clone();
+    // Create all connection tasks at once - they will multiplex over HTTP/2
+    for _ in 0..total_connections {
+        let client = client.clone();
+        let method = method.clone();
+        let url = args.url.clone();
+        let headers = headers.clone();
+        let body = args.body.clone();
+        let result = result.clone();
 
-            let handle = thread::spawn(move || {
-                while Instant::now() < end_time {
-                    let start = Instant::now();
-                    let success = make_request(&client, &method, &url, &headers, &body);
-                    let latency = start.elapsed();
-                    result.record_request(success, latency);
-                }
-            });
-
-            handles.push(handle);
-        }
+        tasks.spawn(async move {
+            while Instant::now() < end_time {
+                let start = Instant::now();
+                let success = make_request(&client, &method, &url, &headers, &body).await;
+                let latency = start.elapsed();
+                result.record_request(success, latency);
+            }
+        });
     }
 
-    for handle in handles {
-        handle.join().unwrap();
-    }
+    while tasks.join_next().await.is_some() {}
 
     Ok(())
 }
@@ -297,7 +296,8 @@ fn print_results(result: &BenchmarkResult, total_duration: Duration) {
     }
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let args = Args::parse();
 
     let duration = parse_duration(&args.duration)?;
@@ -319,7 +319,7 @@ fn main() -> Result<()> {
     let result = Arc::new(BenchmarkResult::new());
 
     let start = Instant::now();
-    run_benchmark(args, client, result.clone(), duration)?;
+    run_benchmark(args, client, result.clone(), duration).await?;
     let total_duration = start.elapsed();
 
     print_results(&result, total_duration);
